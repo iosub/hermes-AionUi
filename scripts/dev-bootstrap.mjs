@@ -2,9 +2,11 @@
 import { execSync, spawn } from 'node:child_process';
 import path from 'node:path';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 
 const DEFAULT_PORTS = [5173, 9230];
 const KILLABLE_NAMES = new Set(['electron', 'aionui', 'aionui.exe']);
+const ELECTRON_VITE_DEV_ARGS = ['x', 'electron-vite', 'dev', '--config', 'packages/desktop/electron.vite.config.ts'];
 
 const log = (...args) => console.log('[dev-bootstrap]', ...args);
 const warn = (...args) => console.warn('[dev-bootstrap]', ...args);
@@ -22,6 +24,41 @@ function parseArgs(argv) {
   const flags = new Set(rest.filter((x) => x.startsWith('--')));
   const values = rest.filter((x) => !x.startsWith('--'));
   return { command, values, flags };
+}
+
+function getCurrentUid() {
+  return typeof process.getuid === 'function' ? process.getuid() : null;
+}
+
+export function createElectronViteDevLaunchOptions({
+  env = process.env,
+  uid = getCurrentUid(),
+  multiInstance = false,
+} = {}) {
+  const childEnv = { ...env };
+  const args = [...ELECTRON_VITE_DEV_ARGS];
+
+  if (multiInstance) {
+    childEnv.AIONUI_MULTI_INSTANCE = '1';
+  }
+
+  if (uid === 0) {
+    args.push('--noSandbox');
+  }
+
+  return {
+    command: 'bun',
+    args,
+    env: childEnv,
+  };
+}
+
+export function hasGraphicalDisplay({ platform = process.platform, env = process.env } = {}) {
+  if (platform !== 'linux') {
+    return true;
+  }
+
+  return Boolean(env.DISPLAY || env.WAYLAND_DISPLAY);
 }
 
 function getPidsListeningOnPort(port) {
@@ -150,6 +187,16 @@ function doctor() {
   }
 }
 
+function forwardChildExit(child) {
+  child.on('exit', (code, signal) => {
+    if (signal) {
+      process.kill(process.pid, signal);
+      return;
+    }
+    process.exit(code ?? 0);
+  });
+}
+
 function launch(scriptName, withExtensions) {
   if (!scriptName) {
     throw new Error(
@@ -176,13 +223,33 @@ function launch(scriptName, withExtensions) {
     shell: isWindows(),
   });
 
-  child.on('exit', (code, signal) => {
-    if (signal) {
-      process.kill(process.pid, signal);
-      return;
-    }
-    process.exit(code ?? 0);
+  forwardChildExit(child);
+}
+
+function launchElectronDev(flags) {
+  if (!hasGraphicalDisplay()) {
+    console.error(
+      '[dev-bootstrap] no graphical display detected. Desktop Electron mode requires X11/Wayland. Use `xvfb-run -a bun start` for a virtual display, or `bun run webui` for headless browser access.'
+    );
+    process.exit(1);
+  }
+
+  const launchOptions = createElectronViteDevLaunchOptions({
+    multiInstance: flags.has('--multi-instance'),
   });
+
+  if (getCurrentUid() === 0) {
+    log('running Electron dev as root; enabling electron-vite --noSandbox');
+  }
+
+  const child = spawn(launchOptions.command, launchOptions.args, {
+    cwd: process.cwd(),
+    env: launchOptions.env,
+    stdio: 'inherit',
+    shell: isWindows(),
+  });
+
+  forwardChildExit(child);
 }
 
 function main() {
@@ -198,7 +265,14 @@ function main() {
     return;
   }
 
+  if (command === 'electron-dev') {
+    launchElectronDev(flags);
+    return;
+  }
+
   throw new Error(`Unknown command: ${command}`);
 }
 
-main();
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main();
+}

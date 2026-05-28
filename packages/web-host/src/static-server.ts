@@ -10,7 +10,9 @@
  */
 
 import http, { type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import fs from 'node:fs';
 import { networkInterfaces } from 'node:os';
+import path from 'node:path';
 import net, { type Socket } from 'node:net';
 import serveHandler from 'serve-handler';
 
@@ -63,6 +65,46 @@ function forwardToBackend(req: IncomingMessage, res: ServerResponse, backendPort
     }
   });
   req.pipe(proxy);
+}
+
+function rewriteIndexAssetPaths(indexHtml: string): string {
+  return indexHtml.replace(/((?:src|href)=["'])\.\//g, '$1/');
+}
+
+function shouldServeSpaIndex(req: IncomingMessage, staticDir: string): boolean {
+  if (!req.url || !req.method || (req.method !== 'GET' && req.method !== 'HEAD')) {
+    return false;
+  }
+
+  const pathname = new URL(req.url, 'http://127.0.0.1').pathname;
+  if (pathname === '/' || pathname === '') {
+    return true;
+  }
+
+  const relativePath = pathname.replace(/^\/+/, '');
+  if (!relativePath) {
+    return true;
+  }
+
+  const filePath = path.resolve(staticDir, relativePath);
+  const staticRoot = path.resolve(staticDir);
+
+  if (!filePath.startsWith(`${staticRoot}${path.sep}`) && filePath !== staticRoot) {
+    return false;
+  }
+
+  return !fs.existsSync(filePath);
+}
+
+function serveSpaIndex(req: IncomingMessage, res: ServerResponse, staticDir: string): void {
+  const indexPath = path.join(staticDir, 'index.html');
+  const body = rewriteIndexAssetPaths(fs.readFileSync(indexPath, 'utf-8'));
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+  res.end(body);
 }
 
 // Max bytes we peek before forcing a routing decision. An HTTP request-line
@@ -145,10 +187,14 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
         return;
       }
 
-      // static files + SPA fallback
+      if (shouldServeSpaIndex(req, opts.staticDir)) {
+        serveSpaIndex(req, res, opts.staticDir);
+        return;
+      }
+
+      // static files
       await serveHandler(req, res, {
         public: opts.staticDir,
-        rewrites: [{ source: '**', destination: '/index.html' }],
       });
     } catch (err) {
       if (!res.headersSent) {

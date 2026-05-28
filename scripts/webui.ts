@@ -18,12 +18,12 @@
  *   AIONUI_BACKEND_BUNDLED_DIR : dir containing bundled-aioncore/<plat-arch>/binary
  */
 
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { fileURLToPath } from 'url';
-import { startWebHost } from '@aionui/web-host';
+import { fileURLToPath, pathToFileURL } from 'url';
+import { findAvailablePort, startWebHost, type WebHostHandle, type WebHostOptions } from '@aionui/web-host';
 
 // Aligned with packages/desktop/src/common/config/constants.ts WEBUI_DEFAULT_PORT.
 const DEFAULT_PORT = (() => {
@@ -103,6 +103,13 @@ function resolvePort(): number {
   return DEFAULT_PORT;
 }
 
+function isPortExplicitlyConfigured(): boolean {
+  const cli = getFlag('--port');
+  if (cli && /^\d+$/.test(cli)) return true;
+  const env = process.env.AIONUI_PORT ?? process.env.PORT;
+  return Boolean(env && /^\d+$/.test(env));
+}
+
 function resolveAllowRemote(): boolean {
   if (has('--remote')) return true;
   const host = process.env.AIONUI_HOST?.trim();
@@ -134,25 +141,97 @@ function runPackageIfNeeded(): void {
   console.log(`[webui] package finished in ${((Date.now() - start) / 1000).toFixed(1)}s`);
 }
 
-function resolveBackendBinary(): string {
-  if (process.env.AIONUI_BACKEND_BIN) return process.env.AIONUI_BACKEND_BIN;
+function resolveBundledBackendPath({
+  env = process.env,
+  projectRoot = repoRoot,
+  platform = process.platform,
+  arch = process.arch,
+}: {
+  env?: NodeJS.ProcessEnv;
+  projectRoot?: string;
+  platform?: NodeJS.Platform;
+  arch?: string;
+} = {}): string {
+  const bundledBase = env.AIONUI_BACKEND_BUNDLED_DIR ?? path.join(projectRoot, 'resources', 'bundled-aioncore');
+  return path.join(bundledBase, `${platform}-${arch}`, BACKEND_BINARY);
+}
 
-  const bundledBase = process.env.AIONUI_BACKEND_BUNDLED_DIR ?? path.join(repoRoot, 'resources', 'bundled-aioncore');
-  const runtimeKey = `${process.platform}-${process.arch}`;
-  const bundled = path.join(bundledBase, runtimeKey, BACKEND_BINARY);
-  if (fs.existsSync(bundled)) return bundled;
+function prepareBundledBackend(projectRoot: string): void {
+  console.log('[webui] backend binary missing; running prepareAioncore...');
+  execFileSync(process.execPath, [path.join(projectRoot, 'scripts', 'prepareAioncore.js')], {
+    cwd: projectRoot,
+    stdio: 'inherit',
+    env: process.env,
+  });
+}
+
+export function resolveBackendBinary({
+  env = process.env,
+  projectRoot = repoRoot,
+  platform = process.platform,
+  arch = process.arch,
+  existsSync = fs.existsSync,
+  execCommand = execSync,
+  prepare = prepareBundledBackend,
+}: {
+  env?: NodeJS.ProcessEnv;
+  projectRoot?: string;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  existsSync?: (path: fs.PathLike) => boolean;
+  execCommand?: typeof execSync;
+  prepare?: (projectRoot: string) => void;
+} = {}): string {
+  if (env.AIONUI_BACKEND_BIN) return env.AIONUI_BACKEND_BIN;
+
+  const bundled = resolveBundledBackendPath({ env, projectRoot, platform, arch });
+  if (existsSync(bundled)) return bundled;
 
   try {
-    const cmd = process.platform === 'win32' ? `where ${BACKEND_BINARY}` : `which ${BACKEND_BINARY}`;
-    const found = execSync(cmd, { encoding: 'utf-8', timeout: 5000 }).trim().split(/\r?\n/)[0];
-    if (found && fs.existsSync(found)) return found;
+    const cmd = platform === 'win32' ? `where ${BACKEND_BINARY}` : `which ${BACKEND_BINARY}`;
+    const found = execCommand(cmd, { encoding: 'utf-8', timeout: 5000 }).trim().split(/\r?\n/)[0];
+    if (found && existsSync(found)) return found;
   } catch {
     // fall through
   }
 
+  prepare(projectRoot);
+
+  if (existsSync(bundled)) return bundled;
+
   throw new Error(
-    `Cannot find "${BACKEND_BINARY}". Set AIONUI_BACKEND_BIN, put it on PATH, or place it at ${bundled}.`
+    `Cannot find "${BACKEND_BINARY}". Tried system PATH and auto-prepare. Set AIONUI_BACKEND_BIN, put it on PATH, or place it at ${bundled}.`
   );
+}
+
+function isAddrInUseError(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && 'code' in error && (error as { code?: string }).code === 'EADDRINUSE');
+}
+
+export async function startWebHostWithPortFallback({
+  options,
+  portExplicit,
+  start = startWebHost,
+  findPort = findAvailablePort,
+  warn = console.warn,
+}: {
+  options: WebHostOptions;
+  portExplicit: boolean;
+  start?: (opts: WebHostOptions) => Promise<WebHostHandle>;
+  findPort?: () => Promise<number>;
+  warn?: (message: string) => void;
+}): Promise<WebHostHandle> {
+  try {
+    return await start(options);
+  } catch (error) {
+    if (portExplicit || !isAddrInUseError(error)) {
+      throw error;
+    }
+
+    const fallbackPort = await findPort();
+    warn(`[webui] port ${options.port} is in use; retrying on ${fallbackPort}`);
+    return start({ ...options, port: fallbackPort });
+  }
 }
 
 /**
@@ -201,6 +280,7 @@ async function main(): Promise<void> {
   augmentPathWithNvm();
   runPackageIfNeeded();
   const port = resolvePort();
+  const portExplicit = isPortExplicitlyConfigured();
   const allowRemote = resolveAllowRemote();
   // One working dir for the whole standalone webui: backend SQLite and chat
   // history live here. Admin credentials live in the backend's users table.
@@ -215,29 +295,32 @@ async function main(): Promise<void> {
   console.log('[webui] backend bin:', backendBin);
   console.log(`[webui] launching  : port=${port} allowRemote=${allowRemote}`);
 
-  const handle = await startWebHost({
-    app: {
-      version: '0.0.0',
-      isPackaged: false,
-      resourcesPath: repoRoot,
-      userDataPath: workDir,
-    },
-    staticDir,
-    port,
-    allowRemote,
-    dataDir: workDir,
-    logDir,
-    // Surface the same work dir on /api/system/info so the browser UI shows
-    // where standalone webui is actually persisting data. Without this the
-    // backend inherits process.env and may report the parent shell's cwd.
-    dirs: {
-      cacheDir: workDir,
-      workDir: workDir,
+  const handle = await startWebHostWithPortFallback({
+    portExplicit,
+    options: {
+      app: {
+        version: '0.0.0',
+        isPackaged: false,
+        resourcesPath: repoRoot,
+        userDataPath: workDir,
+      },
+      staticDir,
+      port,
+      allowRemote,
+      dataDir: workDir,
       logDir,
-    },
-    backend: {
-      kind: 'ownBackend',
-      resolveBackend: () => backendBin,
+      // Surface the same work dir on /api/system/info so the browser UI shows
+      // where standalone webui is actually persisting data. Without this the
+      // backend inherits process.env and may report the parent shell's cwd.
+      dirs: {
+        cacheDir: workDir,
+        workDir: workDir,
+        logDir,
+      },
+      backend: {
+        kind: 'ownBackend',
+        resolveBackend: () => backendBin,
+      },
     },
   });
 
@@ -304,7 +387,9 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
-main().catch((err) => {
-  console.error('[webui] failed to start:', err instanceof Error ? err.message : err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch((err) => {
+    console.error('[webui] failed to start:', err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+}

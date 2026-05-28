@@ -66,6 +66,26 @@ describe('static-server', () => {
     expect(await r.text()).toContain('<title>root</title>');
   });
 
+  it('SPA fallback rewrites relative asset URLs to root-relative paths', async () => {
+    await fs.writeFile(
+      path.join(staticDir, 'index.html'),
+      '<!doctype html><link rel="manifest" href="./manifest.webmanifest"><script type="module" src="./assets/main.js"></script>'
+    );
+    await fs.writeFile(path.join(staticDir, 'manifest.webmanifest'), '{"name":"fixture"}');
+
+    const backend = await startMockBackend((_req, res) => res.end('nope'));
+    stopBackend = backend.close;
+    handle = await startStaticServer({ staticDir, backendPort: backend.port, port: 0 });
+
+    const r = await fetch(`${handle.localUrl}/settings/webui`);
+    expect(r.status).toBe(200);
+    const text = await r.text();
+    expect(text).toContain('href="/manifest.webmanifest"');
+    expect(text).toContain('src="/assets/main.js"');
+    expect(text).not.toContain('href="./manifest.webmanifest"');
+    expect(text).not.toContain('src="./assets/main.js"');
+  });
+
   it('static asset /assets/main.js served', async () => {
     const backend = await startMockBackend((_req, res) => res.end('nope'));
     stopBackend = backend.close;
